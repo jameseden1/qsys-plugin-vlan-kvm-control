@@ -1,0 +1,1128 @@
+PluginInfo =
+{
+  Name = "VLAN KVM Control",
+  Version = "0.1",
+  Id = "53fd2950-b570-497c-baeb-5180b980fcbe",
+  Description = "Control KVM's via a Cisco 3750 Switch",
+  Author = "James Eden"
+}
+
+
+-------------------
+-- Helper functions
+-------------------
+
+function string.starts(String, Start)
+  return string.sub(String, 1, string.len(Start)) == Start
+end
+
+function TableLength(T)
+  -- https://stackoverflow.com/a/2705804
+  local count = 0
+  for _ in pairs(T) do count = count + 1 end
+  return count
+end
+
+function GetMinVLAN()
+  -- the lowest allowed VLAN ID
+  return 2
+end
+
+function GetMaxVLAN()
+  return 4094
+end
+
+function Trim(s)
+  -- http://lua-users.org/wiki/StringTrim
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+function IsEmpty(s)
+  -- https://stackoverflow.com/a/19667498
+  s = Trim(s)
+  return s == nil or s == ""
+end
+
+function ParseInt(n)
+  -- Given a string, tries to make it an int
+  -- returns number if valid int, else nil
+  n = tonumber(n)
+  if n == nil then
+    return nil
+  end
+
+  if n == math.floor(n) then
+    return n
+  else
+    return nil
+  end
+end
+
+function TableContains(table, key)
+  return table[key] ~= nil
+end
+
+function ParseShowVLAN(data)
+  -- Given the response from a 'show vlan' command, this function
+  -- will parse the port to vlan allocations and return a table.
+  -- Key = port_id, value = vlan_id
+
+  -- split the lines into an array
+  lines = {}
+  for s in data:gmatch("([^\n]*)\n?") do
+      table.insert(lines, s)
+  end
+
+  -- find the start and end of the vlan section
+  in_vlan_section = false
+  current_vlan = nil
+  allocations = {}
+  for k, line in pairs(lines) do
+    if string.starts(line, 'VLAN') then
+      if in_vlan_section == true then
+        in_vlan_section = false
+      else
+        in_vlan_section = true
+      end
+    end
+
+    if in_vlan_section == true then
+      vlan_id = tonumber(string.sub (line, 1, 4))
+      if not(vlan_id == nil) then
+        current_vlan = vlan_id
+      end
+
+      -- find all ports
+      for port_id in line:gmatch("(Gi[0-9]/[0-9]/[0-9]*)") do
+        allocations[port_id] = current_vlan
+      end
+    end
+  end
+
+  return allocations
+end
+
+---------------------------
+-- Q-SYS REQUIRED FUNCTIONS
+---------------------------
+
+function GetPrettyName(props)
+  return "KVM Control v"..PluginInfo.Version
+end
+
+pagenames = {"Setup", "Tx", "Rx", "Debug", "Debug2"}
+function GetPages(props)
+  local pages = {}
+  local function AddPage(name) table.insert( pages, { name = name }) end
+  for ix,name in ipairs(pagenames) do
+    AddPage(pagenames[ix])
+  end
+  return pages
+end
+
+function GetProperties()
+  local props = {}
+  table.insert(props,{Name="Tx Count", Type="integer", Min=1, Max=10, Value=1})
+  table.insert(props,{Name="Rx Count", Type="integer", Min=1, Max=10, Value=1})
+  return props
+end
+
+function GetControls(props)
+  -- Define the controls that are available.
+  -- The ctls table will contain these controls.
+  -- NOTE: if you don't specify a property such as "ControlType",
+  -- then it will inherit the same type from the option that was defined before it.
+  local ctls = {
+    -- Default Setup/Status Controls
+    { Name = "hwenable", ControlType = "Button", ButtonType = "Toggle" },
+    { Name = "hwset", ControlType = "Button", ButtonType = "Trigger", PinStyle="Input" },
+    { Name = "hwreset", ControlType = "Button", ButtonType = "Trigger" },
+    { Name = "hwstatus", ControlType = "Indicator", IndicatorType = "Status", IsReadOnly = true, Count = 1 },
+    { Name = "hwip", ControlType = "Text" },
+    { Name = "hwusername", ControlType = "Text" },
+    { Name = "hwpassword", ControlType = "Text" },
+    { Name = "hwswname", ControlType = "Text" },
+    { Name = "debug", IsReadOnly = true, },
+    { Name = "debug2", IsReadOnly = true, },
+    { Name = "hwcountdown", IsReadOnly = true, },
+  }
+
+  local tx_types = {
+    c = { ct="Text", suf="portid" },
+    f = { ct="Text", suf="vlanid" },
+    n = { ct="Text", suf="name" },
+  }
+
+  for i=1,props["Tx Count"].Value do
+    local prefix = string.format("tx.%i.",i)
+
+    for k,bctl in pairs(tx_types) do
+      table.insert(ctls,{Name=string.format("%s%s",prefix,bctl.suf),ControlType=bctl.ct,IndicatorType=bctl.it,ButtonType=bctl.bt,Count=1,UserPin=true,PinStyle=bctl.PinStyle})
+    end
+  end
+
+  local rx_types = {
+    c = { ct="Text", suf="portid" },
+    f = { ct="Text", suf="vlanid", PinStyle="Both" },
+    n = { ct="Text", suf="name" },
+  }
+
+  for i=1,props["Rx Count"].Value do
+    local prefix = string.format("rx.%i.",i)
+
+    for k,bctl in pairs(rx_types) do
+      table.insert(ctls,{Name=string.format("%s%s",prefix,bctl.suf),ControlType=bctl.ct,IndicatorType=bctl.it,ButtonType=bctl.bt,Count=1,UserPin=true,PinStyle=bctl.PinStyle})
+    end
+  end
+
+  return ctls
+end
+
+function GetControlLayout(props)
+  local CurrentPage = pagenames[props["page_index"].Value]
+  local layout,graphics = {},{}
+
+  if CurrentPage=="Setup" then
+    local function PrettyName(prefix,str) return string.format("%s~%s",prefix,str) end
+    local setup = {
+      prefix = "Setup - ",
+      ctls = {
+        hwenable = {PrettyName="Connect",Style="Button",Color={197,221,159},Legend="Connect",Font="Roboto",FontStyle="Bold",FontSize=12,ButtonStyle="Toggle",Position={247,20},Size={72,20}},
+        hwset = {PrettyName="Set Config",Style="Button",Legend="Set Config",Font="Roboto",FontStyle="Bold",FontSize=12,ButtonStyle="Trigger",Position={165,20},Size={72,20}},
+        hwreset = {PrettyName="Reset",Style="Button",Legend="Reset",Font="Roboto",FontStyle="Bold",FontSize=12,ButtonStyle="Trigger",Position={83,20},Size={72,20}},
+        hwstatus = {PrettyName="Status",Style="Text",Font="Roboto",FontStyle="Medium",FontSize=14,Position={11,50},Size={307,25}},
+        hwip = {PrettyName="IP Address",Style="Text",Margin=0,Font="Roboto",FontStyle="Medium",FontSize=13,Position={167,85},Size={150,24}},
+        hwusername = {PrettyName="Username",Style="Text",Margin=0,Font="Roboto",FontStyle="Medium",FontSize=13,Position={167,119},Size={150,24}},
+        hwpassword = {PrettyName="Password",Style="Text",Margin=0,Font="Roboto",FontStyle="Medium",FontSize=13,Position={167,153},Size={150,24}},
+        hwswname = {PrettyName="SW Name",Style="Text",Margin=0,Font="Roboto",FontStyle="Medium",FontSize=13,Position={167,187},Size={150,24}},
+        hwcountdown = {PrettyName="Countdown",Style="Text",Margin=0,Font="Roboto",FontStyle="Medium",FontSize=13,Position={167,221},Size={150,24}},
+      },
+      graphics = {
+        {Type="GroupBox",Text="Connect",FontSize=12,Font="Roboto",FontStyle="Bold",HTextAlign="Left",StrokeWidth=1,CornerRadius=8,Position={0,10},Size={331,243}},
+        {Type="Label",Text="Switch IP",Font="Roboto",FontStyle="Medium",FontSize=13,HTextAlign="Right",Position={11,85},Size={154,24}},
+        {Type="Label",Text="Switch Username",Font="Roboto",FontStyle="Medium",FontSize=13,HTextAlign="Right",Position={11,119},Size={154,24}},
+        {Type="Label",Text="Switch Password",Font="Roboto",FontStyle="Medium",FontSize=13,HTextAlign="Right",Position={11,153},Size={154,24}},
+        {Type="Label",Text="Switch Name",Font="Roboto",FontStyle="Medium",FontSize=13,HTextAlign="Right",Position={11,187},Size={154,24}},
+      }
+    }
+
+    for _,tbl in ipairs{setup} do
+      local pre = tbl.prefix
+      for name,ctl in pairs(tbl.ctls) do
+        ctl.PrettyName = PrettyName(pre,ctl.PrettyName)
+        layout[name] = ctl
+      end
+      for _,grT in pairs(tbl.graphics) do
+        local item={}
+        for prop,val in pairs(grT) do item[prop] = val end
+        table.insert(graphics,item)
+      end
+    end
+  elseif CurrentPage=="Tx" then
+    local txset = {
+      portid= {
+        name="PORT ID",
+        style="Text",
+        position_x = 0,
+        position_y = 0,
+        width = 100,
+        fontsize=12,
+        wordwrap=true,
+      },
+      vlanid= {
+        name="VLAN ID",
+        style="Text",
+        position_x = 100,
+        position_y = 0,
+        width = 100,
+        fontsize=12,
+        wordwrap=true,
+      },
+      name= {
+        name="NAME",
+        style="Text",
+        position_x = 200,
+        position_y = 0,
+        width = 100,
+        fontsize=12,
+        wordwrap=true,
+      },
+    }
+
+    local btncnt = tonumber(props["Tx Count"].Value)
+    local xoffset = 40
+    local yoffset = 40
+
+    local height = 50 + btncnt*28 + 25
+
+    local tooltip = "VLAN ID must be a number.\nPORT ID must be in format 'Gi1/0/x'"
+
+    graphics = {
+      {Type="GroupBox",Text="Transmitters",FontSize=12,Font="Roboto",FontStyle="Bold",HTextAlign="Left",StrokeWidth=1,CornerRadius=8,Position={0,10},Size={350,height}},
+    }
+
+    table.insert(graphics,{Type="Label",Text="PORT ID",Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+0, yoffset-18},Size={100,18}})
+    table.insert(graphics,{Type="Label",Text="VLAN ID",Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+100, yoffset-18},Size={100,18}})
+    table.insert(graphics,{Type="Label",Text="NAME",Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+200, yoffset-18},Size={100,18}})
+    table.insert(graphics,{Type="Label",Text=tooltip,Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+0, yoffset+(btncnt*28)},Size={200,25}})
+
+    for b=1, btncnt do
+      local prefix = string.format("tx.%i.", b)
+      local prettyname_prefix = string.format("Tx %i ", b)
+
+      for item_name, item in pairs(txset) do
+        local pos_x = xoffset + item.position_x
+        local pos_y = yoffset + item.position_y + 28 * b - 28
+
+        layout[prefix..item_name]={
+          PrettyName=prettyname_prefix..item.name,
+          Style=item.style,
+          FontSize=item.fontsize,
+          ButtonStyle=item.btntype,
+          WordWrap=item.wordwrap,
+          Margin=1,
+          Position={pos_x, pos_y},
+          Size={item.width, 24},
+        }
+      end
+
+      table.insert(graphics,{Type="Label",Text=prettyname_prefix,Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset-40, yoffset + 28 * b - 28},Size={40,24}})
+    end
+  elseif CurrentPage=="Rx" then
+    local rxset = {
+      portid= {
+        name="PORT ID",
+        style="Text",
+        position_x = 0,
+        position_y = 0,
+        width = 100,
+        fontsize=12,
+        wordwrap=true,
+      },
+      vlanid= {
+        name="VLAN ID",
+        style="ComboBox",
+        position_x = 100,
+        position_y = 0,
+        width = 100,
+        fontsize=12,
+        wordwrap=true,
+      },
+      name= {
+        name="NAME",
+        style="Text",
+        position_x = 200,
+        position_y = 0,
+        width = 100,
+        fontsize=12,
+        wordwrap=true,
+      },
+    }
+
+    local tooltip = "PORT ID must be in format 'Gi1/0/x'"
+
+    local btncnt = tonumber(props["Rx Count"].Value)
+    local xoffset = 40
+    local yoffset = 40
+
+    local height = 50 + btncnt*28 + 25
+
+    graphics = {
+      {Type="GroupBox",Text="Receivers",FontSize=12,Font="Roboto",FontStyle="Bold",HTextAlign="Left",StrokeWidth=1,CornerRadius=8,Position={0,10},Size={350,height}},
+    }
+
+    table.insert(graphics,{Type="Label",Text="PORT ID",Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+0, yoffset-18},Size={100,18}})
+    table.insert(graphics,{Type="Label",Text="VLAN ID",Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+100, yoffset-18},Size={100,18}})
+    table.insert(graphics,{Type="Label",Text="NAME",Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+200, yoffset-18},Size={100,18}})
+    table.insert(graphics,{Type="Label",Text=tooltip,Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset+0, yoffset+(btncnt*28)},Size={200,25}})
+
+    for b=1, btncnt do
+      local prefix = string.format("rx.%i.", b)
+      local prettyname_prefix = string.format("Rx %i ", b)
+
+      for item_name, item in pairs(rxset) do
+        local pos_x = xoffset + item.position_x
+        local pos_y = yoffset + item.position_y + 28 * b - 28
+
+        layout[prefix..item_name]={
+          PrettyName=prettyname_prefix..item.name,
+          Style=item.style,
+          FontSize=item.fontsize,
+          ButtonStyle=item.btntype,
+          WordWrap=item.wordwrap,
+          Margin=1,
+          Position={pos_x, pos_y},
+          Size={item.width, 24},
+        }
+      end
+
+      table.insert(graphics,{Type="Label",Text=prettyname_prefix,Font="Lato",FontStyle="Black",FontSize=12,Position={xoffset-40, yoffset + 28 * b - 28},Size={40,24}})
+    end
+  elseif CurrentPage=="Debug" then
+    graphics = {
+      {Type="GroupBox",Text="Debug",FontSize=12,Font="Roboto",FontStyle="Bold",HTextAlign="Left",StrokeWidth=1,CornerRadius=8,Position={0,10},Size={350,200}},
+    }
+
+    layout["debug"] = {
+      PrettyName = "debug",
+      Style = "text",
+      HTextAlign = "Left",
+      VTextAlign = "Top",
+      FontSize = 12,
+      WordWrap = true,
+      Position = { 10, 40 },
+      Size = {330, 160},
+    }
+  elseif CurrentPage=="Debug2" then
+    graphics = {
+      {Type="GroupBox",Text="Debug2",FontSize=12,Font="Roboto",FontStyle="Bold",HTextAlign="Left",StrokeWidth=1,CornerRadius=8,Position={0,10},Size={450,600}},
+    }
+
+    layout["debug2"] = {
+      PrettyName = "debug2",
+      Style = "text",
+      HTextAlign = "Left",
+      VTextAlign = "Top",
+      FontSize = 12,
+      WordWrap = true,
+      Position = { 10, 40 },
+      Size = {430, 560},
+    }
+  end
+
+  return layout, graphics
+end
+
+
+----------
+-- RUNTIME
+----------
+
+if Controls then
+  local is_connected = false
+  local is_enabled = false
+  status_state = {OK=0,COMPROMISED=1,FAULT=2,NOTPRESENT=3,MISSING=4,INITIALIZING=5}
+  local mappings = {
+    tx = {
+      devices = {
+        -- {
+        --   controls: {
+        --     portid: <control>,
+        --     vlanid: <control>,
+        --     name: <control>,
+        --   },
+        -- },
+      }
+    },
+    rx = {
+      devices = {
+        -- {
+        --   controls: {
+        --     portid: <control>,
+        --     vlanid: <control>,
+        --     name: <control>,
+        --   },
+        -- }
+      }
+    },
+  }
+  local switch_allocations = nil
+  local our_allocations = {}
+  local snapshot = nil
+  local seconds_remaining = nil
+  local has_edited = false
+  local ResetTimer = Timer.New()
+
+  local current_command = ''
+  local term_length_set = false
+  local current_task = nil
+
+  -- setup socket
+  sock = TcpSocket.New()
+
+  function ReportStatus(state, msg)
+    Controls.hwstatus.Value = status_state[state]
+    Controls.hwstatus.String = msg
+  end
+
+  function AddDebug(text)
+    Log.Message(text)
+
+    -- prepend to the debug2 output
+    -- limit to 10000 characters
+    dt = os.date("!%Y-%m-%d %H:%M:%S")
+    debugstr = string.format("%s: %s\n%s", dt, text, Controls.debug2.String)
+    debugstr = string.sub(debugstr, 1, 10000)
+    Controls.debug2.String = debugstr
+  end
+
+  local function GetVLANChoices()
+    local VLANChoices = {}
+
+    for deviceid, device in pairs(mappings.tx.devices) do
+      name = device.controls["name"].String
+      val = string.format("%i:%s", deviceid, name)
+      table.insert(VLANChoices,val)
+    end
+
+    table.sort(VLANChoices)
+    return VLANChoices
+  end
+
+  local function GetTxDeviceNameByDeviceID(deviceid)
+    deviceid = tonumber(deviceid)
+    return mappings.tx.devices[deviceid].controls["name"].String
+  end
+
+  local function GetTxVLANIDByDeviceID(deviceid)
+    deviceid = tonumber(deviceid)
+    return mappings.tx.devices[deviceid].controls["vlanid"].String
+  end
+
+  local function GetTxDeviceIDByVal(field, value)
+    if IsEmpty(value) == true then
+      return nil
+    end
+
+    for deviceid, device in pairs(mappings.tx.devices) do
+      if device.controls[field].String == value then
+        return deviceid
+      end
+    end
+    return nil
+  end
+
+  local function GetRxDeviceIDByVal(field, value)
+    if IsEmpty(value) == true then
+      return nil
+    end
+
+    for deviceid, device in pairs(mappings.rx.devices) do
+      if device.controls[field].String == value then
+        return deviceid
+      end
+    end
+    return nil
+  end
+
+  local function IsEnabled()
+    return Controls.hwenable.Boolean
+  end
+
+  local function RefreshScreen()
+    AddDebug('call RefreshScreen()')
+    if Controls.hwenable.Boolean == true then
+      Controls.hwenable.Legend = "Disable"
+    else
+      Controls.hwenable.Legend = "Enable"
+    end
+
+    if has_edited == false or switch_allocations == nil then
+      Controls.hwreset.IsDisabled = true
+      Controls.hwset.IsDisabled = true
+    else
+      Controls.hwreset.IsDisabled = false
+      Controls.hwset.IsDisabled = false
+    end
+
+    Controls.hwip.IsDisabled = IsEnabled()
+    Controls.hwusername.IsDisabled = IsEnabled()
+    Controls.hwpassword.IsDisabled = IsEnabled()
+    Controls.hwswname.IsDisabled = IsEnabled()
+
+    disable_fields = false
+    if switch_allocations == nil then
+      disable_fields = true
+      Controls.hwset.Legend = 'In Progress'
+    else
+      Controls.hwset.Legend = 'Set Config'
+    end
+
+    --Controls.hwset.IsDisabled = disable_fields
+
+    for deviceid, device in pairs(mappings.tx.devices) do
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        device.controls[suffix].IsDisabled = disable_fields
+      end
+    end
+
+    for deviceid, device in pairs(mappings.rx.devices) do
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        device.controls[suffix].IsDisabled = disable_fields
+      end
+    end
+
+    -- don't do anything with the fields if we're not enabled
+    -- TODO and connected/authenticated?
+    -- if disable_fields == true then
+    --   return
+    -- end
+
+    -- Validate Tx fields
+    for deviceid, device in pairs(mappings.tx.devices) do
+      -- Trim whitespace
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        local val = Trim(device.controls[suffix].String)
+        device.controls[suffix].String = val
+      end
+
+      -- make sure vlanid is a number
+      vlanid = ParseInt(device.controls["vlanid"].String)
+      if vlanid == nil or vlanid < GetMinVLAN() or vlanid > GetMaxVLAN() then
+        device.controls["vlanid"].String = ""
+      else
+        device.controls["vlanid"].String = vlanid
+      end
+
+      -- make sure portid is unique across Tx and Rx
+      portid = device.controls["portid"].String
+      existing_tx_deviceid = GetTxDeviceIDByVal('portid', portid)
+      existing_rx_deviceid = GetRxDeviceIDByVal('portid', portid)
+      if not IsEmpty(portid) and (existing_tx_deviceid ~= deviceid or existing_rx_deviceid ~= nil) then
+        AddDebug('DUplicate portid 1')
+        device.controls["portid"].String = ""
+      end
+
+      -- make sure vlanid is unique across Tx and Rx
+      vlanid = device.controls["vlanid"].String
+      existing_tx_deviceid = GetTxDeviceIDByVal('vlanid', vlanid)
+      if not IsEmpty(vlanid) and (existing_tx_deviceid ~= deviceid) then
+        AddDebug('DUplicate vlanid')
+        device.controls["vlanid"].String = ""
+      end
+
+      -- make sure name is unique across Tx and Rx
+      name = device.controls["name"].String
+      existing_tx_deviceid = GetTxDeviceIDByVal('name', name)
+      existing_rx_deviceid = GetRxDeviceIDByVal('name', name)
+      if not IsEmpty(name) and (existing_tx_deviceid ~= deviceid or existing_rx_deviceid ~= nil) then
+        AddDebug('DUplicate name')
+        device.controls["name"].String = ""
+      end
+
+      -- make sure name isn't blank
+      if IsEmpty(device.controls["name"].String) then
+        device.controls["name"].String = string.format("Tx %i", deviceid)
+      end
+    end
+
+    -- Validate Rx fields
+    vlan_choices = GetVLANChoices()
+    for deviceid, device in pairs(mappings.rx.devices) do
+      -- Set the available dropdown options
+      device.controls["vlanid"].Choices = vlan_choices
+
+      selected = device.controls["vlanid"].String
+      tx_deviceid, tx_name = selected:match("([^:]+):([^:]+)")
+      tx_deviceid = tonumber(tx_deviceid)
+      if tx_deviceid == nil or tx_deviceid > mappings.tx.count then
+        tx_deviceid = 1
+      end
+
+      tx_device_name = GetTxDeviceNameByDeviceID(tx_deviceid)
+      val = string.format("%s:%s", tx_deviceid, tx_device_name)
+      device.controls["vlanid"].String = val
+
+      -- make sure portid is unique across Tx and Rx
+      portid = device.controls["portid"].String
+      existing_tx_deviceid = GetTxDeviceIDByVal('portid', portid)
+      existing_rx_deviceid = GetRxDeviceIDByVal('portid', portid)
+      if not IsEmpty(portid) and (existing_rx_deviceid ~= deviceid or existing_tx_deviceid ~= nil) then
+        AddDebug('DUplicate portid')
+        device.controls["portid"].String = ""
+      end
+
+      -- make sure name is unique across Tx and Rx
+      name = device.controls["name"].String
+      existing_tx_deviceid = GetTxDeviceIDByVal('name', name)
+      existing_rx_deviceid = GetRxDeviceIDByVal('name', name)
+      if not IsEmpty(name) and (existing_rx_deviceid ~= deviceid or existing_tx_deviceid ~= nil) then
+        AddDebug('DUplicate name')
+        device.controls["name"].String = ""
+      end
+
+      -- make sure name isn't blank
+      if IsEmpty(device.controls["name"].String) then
+        device.controls["name"].String = string.format("Rx %i", deviceid)
+      end
+    end
+
+    -- Everything is validated - generate our_allocations
+    our_allocations = {}
+    for deviceid, device in pairs(mappings.tx.devices) do
+      portid = device.controls["portid"].String
+      vlanid = device.controls["vlanid"].String
+
+      if IsEmpty(portid) == false and IsEmpty(vlanid) == false then
+        -- valid mapping - add to our_allocations
+        our_allocations[portid] = vlanid
+      end
+    end
+
+    for deviceid, device in pairs(mappings.rx.devices) do
+      -- Get the portid
+      portid = device.controls["portid"].String
+
+      -- Get the vlanid
+      -- comes in form '<tx_deviceid>:<tx>name>'
+      selected = device.controls["vlanid"].String
+      tx_deviceid, tx_name = selected:match("([^:]+):([^:]+)")
+      if tx_deviceid ~= nil then
+        vlanid = GetTxVLANIDByDeviceID(tx_deviceid)
+
+        if IsEmpty(portid) == false and IsEmpty(vlanid) == false then
+          -- valid mapping - add to our_allocations
+          our_allocations[portid] = vlanid
+        end
+      end
+    end
+
+    -- set the debug output
+    debug = "OUR ALLOCATIONS:\n"
+    for portid, vlanid in pairs(our_allocations) do
+      debug = string.format("%s  %s=%s;", debug, portid, vlanid)
+    end
+    debug = debug .. "\n\n\nSWITCH ALLOCATIONS\n"
+    if switch_allocations == nil then
+      debug = debug .. "have not got allocations yet"
+    else
+      for portid, vlanid in pairs(switch_allocations) do
+        debug = string.format("%s  %s=%s;", debug, portid, vlanid)
+      end
+    end
+    Controls.debug.String = debug
+  end
+
+  local function CreateSnapshot()
+    -- take a copy of the values so we can restore them later if we made a mistake
+    -- just copy the .String values
+
+    local new_snapshot = {
+      tx = {
+        devices = {
+          -- {
+          --   controls: {
+          --     portid: <control>,
+          --     vlanid: <control>,
+          --     name: <control>,
+          --   },
+          -- },
+        }
+      },
+      rx = {
+        devices = {
+          -- {
+          --   controls: {
+          --     portid: <control>,
+          --     vlanid: <control>,
+          --     name: <control>,
+          --   },
+          -- }
+        }
+      },
+    }
+
+    -- do TX
+    for deviceid, device in pairs(mappings.tx.devices) do
+      device_snapshot = {}
+      device_snapshot.controls = {}
+
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        device_snapshot.controls[suffix] = device.controls[suffix].String
+      end
+
+      new_snapshot.tx.devices[deviceid] = device_snapshot
+    end
+
+    -- do RX
+    for deviceid, device in pairs(mappings.rx.devices) do
+      device_snapshot = {}
+      device_snapshot.controls = {}
+
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        device_snapshot.controls[suffix] = device.controls[suffix].String
+      end
+
+      new_snapshot.rx.devices[deviceid] = device_snapshot
+    end
+
+    return new_snapshot
+  end
+
+  local function RestoreSnapshot()
+    AddDebug('RESTORE SNAPSHOT: start')
+    -- we made a mistake, so restore the snapshot
+    for deviceid, device in pairs(snapshot.tx.devices) do
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        val = device.controls[suffix]
+        AddDebug(string.format('RESTORE SNAPSHOT: tx.%i.%s = %s', deviceid, suffix, val))
+        mappings.tx.devices[deviceid].controls[suffix].String = val
+      end
+    end
+
+    -- do RX
+    for deviceid, device in pairs(snapshot.rx.devices) do
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        val = device.controls[suffix]
+        AddDebug(string.format('RESTORE SNAPSHOT: rx.%i.%s = %s', deviceid, suffix, val))
+        mappings.rx.devices[deviceid].controls[suffix].String = val
+      end
+    end
+
+    seconds_remaining = nil
+    snapshot = CreateSnapshot()
+    has_edited = false
+    ResetTimer:Stop()
+    AddDebug('RESTORE SNAPSHOT: done restoring')
+    RefreshScreen()
+  end
+
+  ------------
+  -- something
+  ------------
+
+  function GetVlan()
+    current_task = {}
+    current_task["type"] = "get_vlan"
+    current_task["steps"] = {}
+    current_task["data"] = nil
+
+    -- trigger command
+    sockWrite("show vlan\n")
+  end
+
+  function SetVlan()
+    current_task = {}
+    current_task["type"] = "set_vlan"
+    current_task["steps"] = {}
+    current_task["data"] = nil
+
+    table.insert(current_task.steps, "enable\n")
+    table.insert(current_task.steps, "configure terminal\n")
+
+    for portid, vlanid in pairs(our_allocations) do
+      step1 = string.format("interface range %s\n", portid)
+      table.insert(current_task.steps, step1)
+
+      step2 = string.format("switchport access vlan %s\n", vlanid)
+      table.insert(current_task.steps, step2)
+    end
+
+    table.insert(current_task.steps, "end\n")
+
+    -- trigger command
+    switch_allocations = nil
+    RefreshScreen()
+    sockWrite("\n")
+  end
+
+  ---------------
+  -- Socket Setup
+  ---------------
+
+  function resetState()
+    is_connected = false
+    switch_allocations = nil
+    current_command = ''
+    term_length_set = false
+    current_task = nil
+  end
+
+  function sockConnect()
+    address = Controls.hwip.String
+    port = 23
+
+    sock.ReadTimeout = 0
+    sock.WriteTimeout = 0
+    sock.ReconnectTimeout = 10
+
+    ReportStatus("INITIALIZING","Connecting to socket")
+    sock:Connect(address, port)
+  end
+
+  function sockDisconnect()
+    ReportStatus("COMPROMISED","Disconnecting from socket")
+    resetState()
+    sock:Disconnect()
+  end
+
+  function sockConnected(s)
+    -- NOTE: this *might* happen after we have connected
+    -- and the first data has already been sent
+
+    ReportStatus("INITIALIZING","Connected - waiting login")
+    AddDebug("sockConnected() called")
+  end
+
+  function sockReconnect(s)
+    ReportStatus("FAULT","Reconnecting")
+    AddDebug("sockReconnect() called")
+    resetState()
+  end
+
+  function sockClosed(s)
+    ReportStatus("FAULT","Closed")
+    AddDebug("sockClosed() called")
+    resetState()
+  end
+
+  function sockError(s, err)
+    ReportStatus("FAULT","Error")
+    AddDebug(string.format("sockError() called: %s", err))
+  end
+
+  function sockTimeout(s, err)
+    ReportStatus("FAULT","Timeout")
+    AddDebug(string.format("sockTimeout() called: %s", err))
+    resetState()
+  end
+
+  function sockWrite(command)
+    current_command = command
+    AddDebug(string.format('WRITE: %s', command))
+    sock:Write(command)
+  end
+
+  function sockData(s)
+    if is_connected == false then
+      -- have just connected - reset the state
+      resetState()
+      is_connected = true
+    end
+
+    d = sock:Read(sock.BufferLength)
+
+    -- check if it is the echo, and ignore
+    if string.starts(current_command, d) then
+      -- AddDebug(string.format('IGNORE: %s', d))
+      -- remove this from the start
+      sub_start = string.len(d) + 1
+      sub_end = string.len(current_command)
+      current_command = string.sub(current_command, sub_start, sub_end)
+      return
+    end
+
+    if string.find(d, "Username") then
+      ReportStatus("INITIALIZING", "Connected - waiting username")
+
+      val = string.format("%s\n", Controls.hwusername.String)
+      sockWrite(val)
+      return
+    end
+
+    if string.find(d, "Password") then
+      ReportStatus("INITIALIZING", "Connected - waiting password")
+
+      -- write password
+      val = string.format("%s\n", Controls.hwpassword.String)
+      sock:Write(val)
+
+      term_length_set = false
+      return
+    end
+
+    if string.find(d, "Login invalid") then
+      ReportStatus("FAULT", "Invalid Credentials")
+      return
+    end
+
+    local prefix_a = string.format("%s", Controls.hwswname.String)
+    local prefix_b = string.format("\n%s", Controls.hwswname.String)
+    local is_prompt = false
+    if string.starts(d, prefix_a) or string.find(d, prefix_b) then
+      is_prompt = true
+    end
+
+    -- if we haven't set the terminal length, do that before anything else
+    if not term_length_set then
+      sockWrite("term len 0\n")
+      term_length_set = true
+      return
+    else
+      ReportStatus("OK", "Connected")
+    end
+
+    -- before we proceed, make sure we have switch_allocations
+    if current_task == nil and is_prompt == true and switch_allocations == nil then
+      GetVlan()
+      return
+    end
+
+    -- We're good to go
+    -- Check if there is an active task
+    if current_task == nil then
+      return
+    end
+
+    -- Add the new data to the task record
+    if current_task['data'] == nil then
+      current_task['data'] = d
+    else
+      current_task['data'] = current_task['data'] .. d
+    end
+
+    if current_task['type'] == 'get_vlan' then
+      if is_prompt == true and not (current_task['data'] == '') then
+        AddDebug('Tasks: got to end of get_allocations')
+        switch_allocations = ParseShowVLAN(current_task['data'])
+        RefreshScreen()
+        current_task = nil
+      end
+    elseif current_task['type'] == 'set_vlan' then
+      if is_prompt == true then
+        if TableLength(current_task.steps) > 0 then
+          sockWrite(current_task.steps[1])
+          table.remove(current_task.steps, 1)
+        else
+          AddDebug('Tasks: got to end of set_vlan')
+          current_task = nil
+          GetVlan()
+        end
+      end
+    else
+      AddDebug('Tasks: unknown task.type')
+      current_task = nil
+    end
+  end
+
+  function TimerTick()
+    if seconds_remaining ~= nil and seconds_remaining >= 0 then
+      Controls.hwcountdown.String = string.format("%i", seconds_remaining)
+      seconds_remaining = seconds_remaining - 1
+      
+      if seconds_remaining == 0 then
+        AddDebug("Reset by timer")
+        RestoreSnapshot()
+      end
+    else
+      Controls.hwcountdown.String = ""
+    end
+
+    ResetTimer:Start(1)
+  end
+
+  -----------------
+  -- Click Handlers
+  -----------------
+
+  local function OnClickConnect()
+    -- the value of Controls.hwenable.Boolean is opposite?
+
+    if Controls.hwenable.Boolean == false then
+      -- was enabled, so now disabled
+      sockDisconnect()
+    else
+      -- was disabled, so now enabled
+      sockConnect()
+    end
+
+    RefreshScreen()
+  end
+
+  local function OnClickSet()
+    snapshot = CreateSnapshot()
+    has_edited = false
+    ResetTimer:Stop()
+    SetVlan()
+    RefreshScreen()
+  end
+
+  local function OnClickReset()
+    AddDebug("Clicked reset")
+    RestoreSnapshot()
+    RefreshScreen()
+  end
+
+  local function OnControlChange()
+    -- Called when a Control that should be part of the snapshot is updates
+    has_edited = true -- indicate that some field has changed
+    seconds_remaining = 30
+    ResetTimer:Start(1)
+    RefreshScreen()
+  end
+
+
+  -----------------
+  -- Initialization
+  -----------------
+
+  function Init()
+    ReportStatus("INITIALIZING","done")
+    AddDebug("Call Init()")
+
+    -- first do each Tx
+    local tx = {}
+    tx.count = Properties["Tx Count"].Value
+    tx.devices = {}
+    for i=1, tx.count do
+      local device = {}
+      device.controls = {}
+
+      -- make a reference to each control
+      local control_prefix = string.format("tx.%i.", i)
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        local control_name = string.format("%s%s", control_prefix, suffix)
+        device.controls[suffix] = Controls[control_name]
+        device.controls[suffix].EventHandler = OnControlChange
+      end
+      table.insert(tx.devices, device) --add device to table
+    end
+    mappings["tx"] = tx
+
+    -- first do each rx
+    local rx = {}
+    rx.count = Properties["Rx Count"].Value
+    rx.devices = {}
+    for i=1, rx.count do
+      local device = {}
+      device.controls = {}
+
+      -- make a reference to each control
+      local control_prefix = string.format("rx.%i.", i)
+      for s, suffix in ipairs{"portid", "vlanid", "name"} do
+        local control_name = string.format("%s%s", control_prefix, suffix)
+        device.controls[suffix] = Controls[control_name]
+        device.controls[suffix].EventHandler = OnControlChange
+      end
+      table.insert(rx.devices, device) --add device to table
+    end
+    mappings["rx"] = rx
+
+    -- take a snapshot
+    snapshot = CreateSnapshot()
+
+    RefreshScreen()
+
+    -- Setup Event Handlers
+    Controls.hwenable.EventHandler = OnClickConnect
+    Controls.hwset.EventHandler = OnClickSet
+    Controls.hwreset.EventHandler = OnClickReset
+
+    Controls.hwip.EventHandler = RefreshScreen
+    Controls.hwusername.EventHandler = RefreshScreen
+    Controls.hwpassword.EventHandler = RefreshScreen
+    Controls.hwswname.EventHandler = RefreshScreen
+
+    -- Setup socket callbacks
+    sock.Connected = sockConnected
+    sock.Reconnect = sockReconnect
+    sock.Closed = sockClosed
+    sock.Error = sockError
+    sock.Timeout = sockTimeout
+    sock.Data = sockData
+
+    -- attempt to connect to the socket
+    if Controls.hwenable.Boolean == true then
+      sockConnect()
+    end
+
+    -- done
+    AddDebug("Done Init()")
+
+    ResetTimer.EventHandler = TimerTick
+  end
+
+  -- Start at runtime
+  Controls.debug2.String = ""
+  Init()
+end
